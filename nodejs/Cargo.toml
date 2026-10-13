@@ -12,7 +12,7 @@ crate-type = ["cdylib"]
 hex = "0.4.3"
 napi = { version = "2.12.2", default-features = false, features = ["napi4", "napi6", "tokio_rt", "serde-json"] }
 napi-derive = "2.12.2"
-self_encryption = { version = "0.36.1", path = ".." }
+self_encryption = { version = "0.36.2", path = ".." }
 
 [build-dependencies]
 napi-build = "2.0.1"

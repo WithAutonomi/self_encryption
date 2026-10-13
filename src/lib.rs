@@ -91,6 +91,7 @@
 mod chunk;
 mod cipher;
 mod data_map;
+mod data_map_index;
 mod decrypt;
 mod encrypt;
 mod error;
@@ -110,6 +111,7 @@ pub use xor_name::XorName;
 
 pub use self::{
     data_map::{ChunkInfo, DataMap},
+    data_map_index::DataMapIndex,
     error::{Error, Result},
     stream_decrypt::{streaming_decrypt, streaming_decrypt_with_batch_size, DecryptionStream},
     stream_encrypt::{stream_encrypt, ChunkStream, EncryptionStream},

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 *When editing this file, please respect a line length of 100.*
 
+## [0.36.2] - 2026-10-13
+
+### Added
+- `DataMapIndex` gives random access to a `DataMap`'s content with `u64` positions on every
+  platform, including 32-bit targets such as `wasm32`. It does no I/O: it lists the chunks
+  overlapping a byte range and decrypts single chunks, checking each against the size and source
+  hash the map declares. Decompression stops at the declared size, so crafted chunks cannot expand
+  beyond it.
+
+### Changed
+- `DecryptionStream` is built on `DataMapIndex`. Random access uses `u64` positions and binary
+  searches instead of `usize` sums and linear scans, so it no longer overflows on 32-bit targets,
+  and every decrypted chunk is checked against its declared size and hash. Construction fails for
+  a map whose chunk indices are not exactly `0..n`.
+- On 32-bit targets, `DecryptionStream::file_size` reports `usize::MAX` for content larger than
+  `usize::MAX` bytes; `DataMapIndex::file_size` gives the exact size.
+
+### Fixed
+- `DecryptionStream::get_range` fails when the fetch callback omits a chunk, instead of joining the
+  remaining chunks into wrong content.
+
 ## [0.36.1] - 2026-10-06
 
 ### Changed

@@ -7,10 +7,14 @@
 // according to those terms.
 
 use crate::{cipher, utils::get_pad_key_and_nonce, utils::xor, EncryptedChunk, Error, Result};
+use brotli::Decompressor;
 use bytes::Bytes;
 use rayon::prelude::*;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use xor_name::XorName;
+
+/// Internal buffer of the streaming decompressor, as `brotli::BrotliDecompress` uses.
+const DECOMPRESS_BUFFER_BYTES: usize = 4096;
 
 // encrypted_Chunks are sorted !!
 pub fn decrypt_sorted_set(
@@ -44,6 +48,18 @@ pub fn decrypt_chunk(
     src_hashes: &[XorName],
     child_level: usize,
 ) -> Result<Bytes> {
+    decrypt_chunk_bounded(chunk_index, content, src_hashes, child_level, usize::MAX)
+}
+
+/// As [`decrypt_chunk`], but fails rather than decompress more than
+/// `max_size` bytes.
+pub(crate) fn decrypt_chunk_bounded(
+    chunk_index: usize,
+    content: &Bytes,
+    src_hashes: &[XorName],
+    child_level: usize,
+    max_size: usize,
+) -> Result<Bytes> {
     let pki = get_pad_key_and_nonce(chunk_index, src_hashes, child_level)?;
     let (pad, key, nonce) = pki;
 
@@ -53,11 +69,17 @@ pub fn decrypt_chunk(
     // Then decrypt the content
     let decrypted = cipher::decrypt(xored, &key, &nonce)?;
 
-    // Finally decompress
+    // Finally decompress, reading one byte past the bound to detect an overrun
     let mut decompressed = Vec::new();
-    let mut cursor = Cursor::new(&decrypted);
-
-    brotli::BrotliDecompress(&mut cursor, &mut decompressed).map_err(|_| Error::Compression)?;
+    let _ = Decompressor::new(Cursor::new(&decrypted), DECOMPRESS_BUFFER_BYTES)
+        .take((max_size as u64).saturating_add(1))
+        .read_to_end(&mut decompressed)
+        .map_err(|_| Error::Compression)?;
+    if decompressed.len() > max_size {
+        return Err(Error::Generic(format!(
+            "chunk {chunk_index} decompresses to more than {max_size} bytes"
+        )));
+    }
 
     Ok(Bytes::from(decompressed))
 }

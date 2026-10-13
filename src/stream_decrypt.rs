@@ -9,11 +9,11 @@
 //! Streaming decryption functionality for memory-efficient processing of large encrypted files.
 
 use crate::{
-    decrypt::decrypt_chunk, get_root_data_map_parallel, stream_decrypt_batch_size,
-    utils::extract_hashes, ChunkInfo, DataMap, Result,
+    get_root_data_map_parallel, stream_decrypt_batch_size, DataMap, DataMapIndex, Error, Result,
 };
 use bytes::Bytes;
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::ops::Range;
 use xor_name::XorName;
 
@@ -29,9 +29,7 @@ use xor_name::XorName;
 /// to any byte range within the encrypted file using methods like `get_range()`,
 /// `range()`, and other convenience methods.
 pub struct DecryptionStream<F> {
-    chunk_infos: Vec<ChunkInfo>,
-    src_hashes: Vec<XorName>,
-    child_level: usize,
+    index: DataMapIndex,
     get_chunk_parallel: F,
     current_batch_start: usize,
     current_batch_chunks: Vec<Bytes>,
@@ -83,15 +81,8 @@ where
             data_map.clone()
         };
 
-        let child_level = root_map.child().unwrap_or(0);
-        let mut chunk_infos = root_map.infos().to_vec();
-        chunk_infos.sort_by_key(|info| info.index);
-        let src_hashes = extract_hashes(&root_map);
-
         Ok(Self {
-            chunk_infos,
-            src_hashes,
-            child_level,
+            index: DataMapIndex::new(&root_map)?,
             get_chunk_parallel,
             current_batch_start: 0,
             current_batch_chunks: Vec::new(),
@@ -102,23 +93,23 @@ where
 
     /// Fetches and decrypts the next batch of chunks.
     fn fetch_next_batch(&mut self) -> Result<bool> {
-        if self.current_batch_start >= self.chunk_infos.len() {
+        let chunk_infos = self.index.infos();
+        if self.current_batch_start >= chunk_infos.len() {
             return Ok(false); // No more chunks
         }
 
         let batch_end = self
             .current_batch_start
             .saturating_add(self.batch_size)
-            .min(self.chunk_infos.len());
-        let batch_infos = self
-            .chunk_infos
+            .min(chunk_infos.len());
+        let batch_infos = chunk_infos
             .get(self.current_batch_start..batch_end)
             .ok_or_else(|| {
-                crate::Error::Generic(format!(
+                Error::Generic(format!(
                     "batch range {}..{} out of bounds for chunk_infos (len {})",
                     self.current_batch_start,
                     batch_end,
-                    self.chunk_infos.len()
+                    chunk_infos.len()
                 ))
             })?;
 
@@ -135,12 +126,7 @@ where
         // Decrypt each chunk and store the results
         self.current_batch_chunks.clear();
         for (info, (_index, encrypted_content)) in batch_infos.iter().zip(fetched_chunks) {
-            let decrypted_chunk = decrypt_chunk(
-                info.index,
-                &encrypted_content,
-                &self.src_hashes,
-                self.child_level,
-            )?;
+            let decrypted_chunk = self.index.decrypt_chunk(info.index, &encrypted_content)?;
             self.current_batch_chunks.push(decrypted_chunk);
         }
 
@@ -151,10 +137,11 @@ where
     }
 
     /// Returns the original file size for random access operations.
+    ///
+    /// On 32-bit targets a file larger than `usize::MAX` bytes reports
+    /// `usize::MAX`; [`DataMapIndex::file_size`] gives the exact size.
     pub fn file_size(&self) -> usize {
-        self.chunk_infos
-            .iter()
-            .fold(0, |acc, chunk| acc + chunk.src_size)
+        usize::try_from(self.index.file_size()).unwrap_or(usize::MAX)
     }
 
     /// Decrypts and returns a specific byte range from the encrypted data.
@@ -212,35 +199,18 @@ where
     /// # }
     /// ```
     pub fn get_range(&self, start: usize, len: usize) -> Result<Bytes> {
-        let file_size = self.file_size();
-
-        // Validate range
-        if start >= file_size {
+        let start = start as u64;
+        let end = start.saturating_add(len as u64).min(self.index.file_size());
+        if start >= end {
             return Ok(Bytes::new());
         }
 
-        let end_pos = std::cmp::min(start + len, file_size);
-        let actual_len = end_pos - start;
-
-        if actual_len == 0 {
-            return Ok(Bytes::new());
-        }
-
-        // Calculate which chunks we need using actual chunk sizes from data map
-        // This avoids issues with different MAX_CHUNK_SIZE schemes
-        let start_chunk = self.get_chunk_index_from_infos(start);
-        let end_chunk = self.get_chunk_index_from_infos(end_pos.saturating_sub(1));
-
-        // Collect the chunk hashes we need
-        let mut required_hashes = Vec::new();
-        for chunk_info in &self.chunk_infos {
-            if chunk_info.index >= start_chunk && chunk_info.index <= end_chunk {
-                required_hashes.push((chunk_info.index, chunk_info.dst_hash));
-            }
-        }
-
-        // Sort by index to ensure correct order
-        required_hashes.sort_by_key(|(index, _)| *index);
+        // Collect the hashes of the chunks holding the range, in index order
+        let chunks = self.index.chunks_overlapping(start..end);
+        let required_hashes: Vec<_> = self.index.infos()[chunks.clone()]
+            .iter()
+            .map(|info| (info.index, info.dst_hash))
+            .collect();
 
         // Decrypt the chunks in order and collect the bytes
         let mut all_bytes = Vec::new();
@@ -249,70 +219,19 @@ where
             let chunk_map: HashMap<usize, Bytes> = fetched_chunks.into_iter().collect();
 
             for (chunk_index, _) in batch_hashes {
-                if let Some(encrypted_content) = chunk_map.get(chunk_index) {
-                    let decrypted = decrypt_chunk(
-                        *chunk_index,
-                        encrypted_content,
-                        &self.src_hashes,
-                        self.child_level,
-                    )?;
-                    all_bytes.extend_from_slice(&decrypted);
-                }
+                let encrypted_content = chunk_map.get(chunk_index).ok_or_else(|| {
+                    Error::Generic(format!("chunk {chunk_index} missing from fetched chunks"))
+                })?;
+                let decrypted = self.index.decrypt_chunk(*chunk_index, encrypted_content)?;
+                all_bytes.extend_from_slice(&decrypted);
             }
         }
 
-        let bytes = Bytes::from(all_bytes);
-
-        // Calculate the offset within our decrypted data
-        let start_chunk_pos = self.get_chunk_start_position(start_chunk);
-        let internal_offset = start - start_chunk_pos;
-
-        if internal_offset >= bytes.len() {
-            return Ok(Bytes::new());
-        }
-
-        // Extract just the range we need
-        let available_len = bytes.len() - internal_offset;
-        let range_len = std::cmp::min(actual_len, available_len);
-        let result = bytes.slice(internal_offset..internal_offset + range_len);
-
-        Ok(result)
-    }
-
-    /// Helper method to get the starting byte position of a chunk within the file
-    fn get_chunk_start_position(&self, chunk_index: usize) -> usize {
-        self.chunk_infos
-            .iter()
-            .filter(|info| info.index < chunk_index)
-            .fold(0, |acc, chunk| acc + chunk.src_size)
-    }
-
-    /// Calculate chunk index from position based on actual chunk sizes in chunk_infos.
-    /// This avoids issues when the input datamap was generated using different MAX_CHUNK_SIZE schemes.
-    ///
-    /// # Arguments
-    /// * `position` - Byte position within the file
-    ///
-    /// # Returns
-    /// * `usize` - The chunk index that contains the given position
-    fn get_chunk_index_from_infos(&self, position: usize) -> usize {
-        let mut accumulated_size = 0;
-
-        for chunk_info in &self.chunk_infos {
-            // Check if position falls within this chunk
-            if position >= accumulated_size && position < accumulated_size + chunk_info.src_size {
-                return chunk_info.index;
-            }
-            accumulated_size += chunk_info.src_size;
-        }
-
-        // If position is beyond all chunks, return the last chunk index
-        // This handles the case where position == file_size
-        if let Some(last_chunk) = self.chunk_infos.last() {
-            last_chunk.index
-        } else {
-            0 // Fallback for empty chunk_infos (shouldn't happen in practice)
-        }
+        // Both offsets lie within the fetched chunks, whose bytes fit in memory
+        let chunks_start = self.index.chunk_range(chunks.start).start;
+        let from = (start - chunks_start) as usize;
+        let to = (end - chunks_start) as usize;
+        Ok(Bytes::from(all_bytes).slice(from..to))
     }
 }
 
@@ -1065,145 +984,6 @@ mod tests {
         assert_eq!(sequential_data, original_data.to_vec());
         assert_eq!(random_access_data.as_ref(), &sequential_data[..]);
 
-        Ok(())
-    }
-
-    #[test]
-    fn test_chunk_boundary_underflow_reproduction() -> Result<()> {
-        // This test reproduces the exact scenario reported:
-        // file_size: 16405289714, start_position: 4194304u64
-        // We expect start_chunk_pos <= start_position, and if smaller,
-        // the difference should be less than MAX_CHUNK_SIZE
-
-        let file_size = 16404310194u64 as usize; // ~15.27 GB
-        let start_position = 4194304u64 as usize; // 4MB before end
-
-        // Simulate different MAX_CHUNK_SIZE cheme
-        let max_chunk_size = crate::MAX_CHUNK_SIZE * 2;
-
-        println!("Testing with file_size: {file_size}, start_position: {start_position}");
-
-        // First, create the mock data map to use with get_chunk_index_from_infos
-        // We need this to avoid dependency on MAX_CHUNK_SIZE utility functions
-
-        // Create a mock data map that simulates how chunks would be distributed
-        // for a file of this size. We need to generate chunk infos with realistic
-        // src_size values that match how the encryption algorithm would chunk the data.
-
-        let num_chunks = crate::utils::get_num_chunks_with_variable_max(file_size, max_chunk_size);
-        println!("Total number of chunks: {num_chunks}");
-
-        let mut chunk_infos = Vec::new();
-        let mut accumulated_size = 0;
-
-        // Generate chunk infos with sizes that match the actual chunking algorithm
-        for chunk_index in 0..num_chunks {
-            let chunk_size = crate::utils::get_chunk_size_with_variable_max(
-                file_size,
-                chunk_index,
-                max_chunk_size,
-            );
-
-            // Create a ChunkInfo with dummy hashes (as the test notes, only src_size and index matter)
-            let chunk_info = ChunkInfo {
-                index: chunk_index,
-                dst_hash: crate::hash::content_hash(&[chunk_index as u8]), // Dummy hash
-                src_hash: crate::hash::content_hash(&[(chunk_index + 1) as u8]), // Dummy hash
-                src_size: chunk_size,
-            };
-
-            chunk_infos.push(chunk_info);
-            accumulated_size += chunk_size;
-        }
-
-        // Verify the total size matches
-        assert_eq!(
-            accumulated_size, file_size,
-            "Mock data map total size should match file size"
-        );
-
-        // Create a mock DecryptionStream to test get_chunk_start_position
-        let data_map = DataMap::new(chunk_infos);
-
-        // Create a dummy get_chunk_parallel function (won't be used in this test)
-        let get_chunk_parallel =
-            |_hashes: &[(usize, XorName)]| -> Result<Vec<(usize, Bytes)>> { Ok(Vec::new()) };
-
-        // Create a mock DecryptionStream
-        let mock_stream = DecryptionStream {
-            chunk_infos: data_map.infos().to_vec(),
-            src_hashes: vec![crate::hash::content_hash(&[0u8]); num_chunks], // Dummy hashes
-            child_level: 0,
-            get_chunk_parallel,
-            current_batch_start: 0,
-            current_batch_chunks: Vec::new(),
-            current_batch_index: 0,
-            batch_size: stream_decrypt_batch_size(),
-        };
-
-        // Use the new get_chunk_index_from_infos method instead of the utility function
-        let start_chunk_index = mock_stream.get_chunk_index_from_infos(start_position);
-        println!(
-            "Calculated start_chunk_index using get_chunk_index_from_infos: {start_chunk_index}"
-        );
-
-        // Test get_chunk_start_position
-        let start_chunk_pos = mock_stream.get_chunk_start_position(start_chunk_index);
-
-        println!("start_chunk_pos: {start_chunk_pos}");
-        println!("start_position: {start_position}");
-
-        // Verify our expectations
-        if start_chunk_pos <= start_position {
-            println!("✓ start_chunk_pos <= start_position (as expected)");
-
-            if start_chunk_pos < start_position {
-                let diff = start_position - start_chunk_pos;
-                println!("Difference: {diff}");
-
-                // The difference should be less than max_chunk_size (the local variable used for this test)
-                assert!(
-                    diff <= max_chunk_size,
-                    "Difference {} should be less than {}, but got {}",
-                    diff,
-                    max_chunk_size,
-                    diff
-                );
-                println!("✓ Difference {diff} is less than max_chunk_size");
-            } else {
-                println!("start_chunk_pos exactly equals start_position");
-            }
-        } else {
-            // This is the problematic case that causes underflow
-            let would_underflow = start_chunk_pos - start_position;
-            panic!(
-                "❌ start_chunk_pos ({}) > start_position ({}) by {}, this would cause underflow!",
-                start_chunk_pos, start_position, would_underflow
-            );
-        }
-
-        // Additional verification: calculate what the internal_offset would be
-        let internal_offset = start_position - start_chunk_pos;
-        println!("Calculated internal_offset: {internal_offset}");
-
-        // Verify this is reasonable (should be less than chunk size)
-        // Get chunk size from the actual data map instead of utility function
-        let chunk_size = mock_stream
-            .chunk_infos
-            .iter()
-            .find(|info| info.index == start_chunk_index)
-            .map(|info| info.src_size)
-            .unwrap_or(0);
-        println!("Chunk {start_chunk_index} size: {chunk_size}");
-
-        assert!(
-            internal_offset < chunk_size,
-            "internal_offset {} should be less than chunk size {}",
-            internal_offset,
-            chunk_size
-        );
-
-        println!("✓ Test passed: No underflow condition detected");
         Ok(())
     }
 }

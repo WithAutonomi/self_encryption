@@ -119,21 +119,28 @@ where
             .map(|info| (info.index, info.dst_hash))
             .collect();
 
-        // Fetch chunks in parallel
-        let mut fetched_chunks = (self.get_chunk_parallel)(&batch_hashes)?;
-        fetched_chunks.sort_by_key(|(index, _content)| *index);
-
-        // Decrypt each chunk and store the results
-        self.current_batch_chunks.clear();
-        for (info, (_index, encrypted_content)) in batch_infos.iter().zip(fetched_chunks) {
-            let decrypted_chunk = self.index.decrypt_chunk(info.index, &encrypted_content)?;
-            self.current_batch_chunks.push(decrypted_chunk);
-        }
-
+        self.current_batch_chunks = self.fetch_and_decrypt(&batch_hashes)?;
         self.current_batch_start = batch_end;
         self.current_batch_index = 0;
 
         Ok(true)
+    }
+
+    /// Fetches one batch and decrypts it in batch order, failing if the
+    /// callback omits a requested chunk.
+    fn fetch_and_decrypt(&self, batch_hashes: &[(usize, XorName)]) -> Result<Vec<Bytes>> {
+        let mut fetched_chunks: HashMap<usize, Bytes> = (self.get_chunk_parallel)(batch_hashes)?
+            .into_iter()
+            .collect();
+        batch_hashes
+            .iter()
+            .map(|(chunk_index, _)| {
+                let encrypted_content = fetched_chunks.remove(chunk_index).ok_or_else(|| {
+                    Error::Generic(format!("chunk {chunk_index} missing from fetched chunks"))
+                })?;
+                self.index.decrypt_chunk(*chunk_index, &encrypted_content)
+            })
+            .collect()
     }
 
     /// Returns the original file size for random access operations.
@@ -215,14 +222,7 @@ where
         // Decrypt the chunks in order and collect the bytes
         let mut all_bytes = Vec::new();
         for batch_hashes in required_hashes.chunks(self.batch_size) {
-            let fetched_chunks = (self.get_chunk_parallel)(batch_hashes)?;
-            let chunk_map: HashMap<usize, Bytes> = fetched_chunks.into_iter().collect();
-
-            for (chunk_index, _) in batch_hashes {
-                let encrypted_content = chunk_map.get(chunk_index).ok_or_else(|| {
-                    Error::Generic(format!("chunk {chunk_index} missing from fetched chunks"))
-                })?;
-                let decrypted = self.index.decrypt_chunk(*chunk_index, encrypted_content)?;
+            for decrypted in self.fetch_and_decrypt(batch_hashes)? {
                 all_bytes.extend_from_slice(&decrypted);
             }
         }
@@ -480,6 +480,9 @@ mod tests {
     use crate::{encrypt, test_helpers::random_bytes, Error};
     use std::collections::HashMap;
 
+    /// Enough content for the minimum of three chunks.
+    const SMALL_FILE_BYTES: usize = 10_000;
+
     #[test]
     fn test_streaming_decrypt_basic() -> Result<()> {
         // Create test data
@@ -729,6 +732,33 @@ mod tests {
         assert!(
             found_error,
             "Should have encountered an error for missing chunk"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_omitted_chunk_fails_instead_of_truncating() -> Result<()> {
+        let (data_map, encrypted_chunks) = encrypt(random_bytes(SMALL_FILE_BYTES))?;
+        let storage: HashMap<XorName, Bytes> = encrypted_chunks
+            .into_iter()
+            .map(|chunk| (crate::hash::content_hash(&chunk.content), chunk.content))
+            .collect();
+        let last_chunk = data_map.len() - 1;
+
+        // Succeeds while silently leaving out the last chunk
+        let get_chunks = |hashes: &[(usize, XorName)]| -> Result<Vec<(usize, Bytes)>> {
+            Ok(hashes
+                .iter()
+                .filter(|(index, _)| *index != last_chunk)
+                .map(|(index, hash)| (*index, storage[hash].clone()))
+                .collect())
+        };
+        let mut stream = streaming_decrypt(&data_map, get_chunks)?;
+
+        assert!(stream.range_full().is_err());
+        assert!(
+            stream.any(|chunk| chunk.is_err()),
+            "iteration must fail rather than end early"
         );
         Ok(())
     }

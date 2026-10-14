@@ -25,8 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `usize::MAX` bytes; `DataMapIndex::file_size` gives the exact size.
 
 ### Fixed
-- `DecryptionStream::get_range` fails when the fetch callback omits a chunk, instead of joining the
-  remaining chunks into wrong content.
+- `DecryptionStream` fails when the fetch callback omits a chunk. Before, `get_range` joined the
+  remaining chunks into wrong content, and iteration ended early as if the content were complete.
 
 ## [0.36.1] - 2026-10-06
 

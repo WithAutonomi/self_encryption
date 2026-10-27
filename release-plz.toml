@@ -5,7 +5,3 @@ semver_check = false
 [[package]]
 name = "self_encryption"
 git_tag_name = "v{{ version }}"
-
-[[package]]
-name = "self-encryption-nodejs"
-release = false

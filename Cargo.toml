@@ -1,5 +1,4 @@
 [workspace]
-members = ["nodejs"]
 
 [package]
 authors = ["MaidSafe Developers <dev@maidsafe.net>"]

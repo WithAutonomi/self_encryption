@@ -1,23 +1,21 @@
 name: Benchmarking
 
-on: [pull_request, push]
+# On demand only. Nothing compares or stores the results, and merge.yml's
+# `clippy --all-targets` already compiles the benches on every PR.
+on:
+  workflow_dispatch:
 
 env:
   RUST_BACKTRACE: 1
   RUSTFLAGS: "-D warnings"
-
 
 jobs:
   bench:
     name: Benchmarking
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Generate Cargo.lock
         run: cargo generate-lockfile
@@ -32,9 +30,5 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Cargo build
-        if: steps.${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}.outputs.cache-hit != 'true'
-        run: cargo build --release
-      
       - name: Cargo bench
         run: cargo bench

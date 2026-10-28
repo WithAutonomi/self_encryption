@@ -1,13 +1,20 @@
 name: Security audit
+
+# Daily, so new advisories show up between PRs (merge.yml's cargo-deny only
+# runs on pull requests). Same tool and deny.toml as the PR check.
 on:
   schedule:
     - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
 jobs:
   audit:
-    if: github.repository_owner == 'maidsafe'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/audit-check@v1
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          command: check advisories

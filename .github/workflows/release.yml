@@ -17,13 +17,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macOS-latest]
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - uses: actions/cache@v4
         with:
@@ -49,12 +45,6 @@ jobs:
           fetch-depth: "0"
           token: ${{ secrets.SELF_ENCRYPTION_PAT }}
       - uses: dtolnay/rust-toolchain@stable
-     
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
 
       # This is required to allow `release-plz` to create tags
       - shell: bash
@@ -66,8 +56,11 @@ jobs:
       - shell: bash
         run: cargo binstall --no-confirm release-plz
 
+      # Secrets go through env, not ${{ }} in the script. cargo reads
+      # CARGO_REGISTRY_TOKEN when release-plz publishes, so no `cargo login`.
       - name: publish crates
         shell: bash
-        run: |
-          cargo login "${{ secrets.CRATES_IO_TOKEN }}"
-          release-plz release --git-token ${{ secrets.SELF_ENCRYPTION_PAT }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          GIT_TOKEN: ${{ secrets.SELF_ENCRYPTION_PAT }}
+        run: release-plz release --git-token "$GIT_TOKEN"

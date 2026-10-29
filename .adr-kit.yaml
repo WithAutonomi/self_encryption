@@ -1,0 +1,18 @@
+# ADR kit configuration for repository-level decision governance.
+adr_directory: docs/adr
+filename_pattern: "ADR-[0-9]{4}-[a-z0-9-]+\.md"
+statuses:
+  - Proposed
+  - Accepted
+  - Superseded
+  - Deprecated
+  - Rejected
+immutable_statuses:
+  - Accepted
+required_sections:
+  - Context
+  - Decision
+  - Consequences
+  - Validation
+human_acceptance_required: true
+ai_may_accept: false
